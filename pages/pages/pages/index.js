@@ -407,4 +407,63 @@ export default function DenialAnalyzer() {
 
               <div style={{ background:CARD, border:`1px solid ${BORDER}`, borderRadius:16, padding:"18px 20px" }}>
                 {ai.denialRuleExplained && (
-                  <div style={{ background:"rgba(56,189,248,0.06)", border:"1.5px solid rgba(56,189,248,0.2)", borderRadius:11, padding:"13px 15px", marg
+                  <div style={{ background:"rgba(56,189,248,0.06)", border:"1.5px solid rgba(56,189,248,0.2)", borderRadius:11, padding:"13px 15px", marginBottom:11 }}>
+                    <div style={{ fontSize:11, fontWeight:700, color:ACCENT, textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:7 }}>📖 What {result.denialCode} Means</div>
+                    <p style={{ margin:0, fontSize:13, color:"#a0bcce", lineHeight:1.7 }}>{ai.denialRuleExplained}</p>
+                  </div>
+                )}
+                {isTrue  && <Section icon="❌" title="Why This Denial Is Valid"         color="#ef4444" items={ai.whyTrueDenial} />}
+                {isFalse && <Section icon="✅" title="Why This Denial Is Incorrect"     color="#22c55e" items={ai.whyFalseDenial} />}
+                {isFalse && ai.whyTrueDenial?.length>0  && <Section icon="⚠️" title="What Payer May Cite"       color="#f59e0b" items={ai.whyTrueDenial} />}
+                {isTrue  && ai.whyFalseDenial?.length>0 && <Section icon="💡" title="Potentially Disputable"    color="#a78bfa" items={ai.whyFalseDenial} />}
+                {ai.billingErrors?.length>0    && <Section icon="🔴" title="Billing Errors Identified"          color="#f87171" items={ai.billingErrors} note="These are the likely root cause of the denial." />}
+                {ai.modifierGuidance           && <Section icon="🏷️" title="Modifier Guidance"                 color="#c084fc" items={[ai.modifierGuidance]} />}
+                {isTrue  && ai.correctiveActions?.length>0 && <Section icon="🔧" title="How to Correct & Resubmit" color={ACCENT}  items={ai.correctiveActions} />}
+                {isFalse && ai.appealSteps?.length>0       && <Section icon="⚖️" title="Steps to Appeal & Get Paid" color="#22c55e" items={ai.appealSteps} />}
+                {isTrue  && ai.appealSteps?.length>0       && <Section icon="⚖️" title="Appeal Steps (if disputing)" color="#a78bfa" items={ai.appealSteps} />}
+
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:11, marginBottom:11 }}>
+                  {ai.documentationNeeded?.length>0 && (
+                    <div style={{ background:"rgba(255,255,255,0.02)", border:`1.5px solid ${BORDER}`, borderRadius:11, padding:"13px 15px" }}>
+                      <div style={{ fontSize:11, fontWeight:700, color:"#3a5a7a", textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:9 }}>📁 Documentation Needed</div>
+                      {ai.documentationNeeded.map((d,i) => (
+                        <div key={i} style={{ display:"flex", gap:7, alignItems:"flex-start", marginBottom:5 }}>
+                          <span style={{ color:"#3a5a7a", fontWeight:800, fontSize:12, flexShrink:0 }}>›</span>
+                          <span style={{ fontSize:12, color:"#7a9bbf", lineHeight:1.5 }}>{d}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ display:"flex", flexDirection:"column", gap:11 }}>
+                    {ai.timingAdvice && (
+                      <div style={{ background:"rgba(245,158,11,0.06)", border:"1.5px solid rgba(245,158,11,0.25)", borderRadius:11, padding:"13px 15px", flex:1 }}>
+                        <div style={{ fontSize:11, fontWeight:700, color:"#f59e0b", textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:7 }}>⏰ Timing / Deadline</div>
+                        <p style={{ margin:0, fontSize:12, color:"#a0bcce", lineHeight:1.6 }}>{ai.timingAdvice}</p>
+                      </div>
+                    )}
+                    {ai.escalationPath && (
+                      <div style={{ background:"rgba(167,139,250,0.06)", border:"1.5px solid rgba(167,139,250,0.25)", borderRadius:11, padding:"13px 15px", flex:1 }}>
+                        <div style={{ fontSize:11, fontWeight:700, color:"#c084fc", textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:7 }}>🔺 Escalation Path</div>
+                        <p style={{ margin:0, fontSize:12, color:"#a0bcce", lineHeight:1.6 }}>{ai.escalationPath}</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {ai.preventionTips?.length>0 && <Section icon="🛡️" title="Prevention Tips" color="#34d399" items={ai.preventionTips} />}
+
+                <div style={{ display:"flex", gap:9, marginTop:4 }}>
+                  <button onClick={reset} style={{ flex:1, padding:"10px", borderRadius:9, border:`1.5px solid ${BORDER}`, background:"transparent", color:"#3a5a7a", fontSize:13, fontWeight:600, cursor:"pointer" }}>↺ Analyze Another Denial</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div style={{ textAlign:"center", marginTop:18, fontSize:11, color:"#1a2d47" }}>
+            CARC · RARC · NCCI · All Denial Codes · For revenue cycle use only · Not a legal opinion
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
