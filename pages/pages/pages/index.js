@@ -110,3 +110,301 @@ function Section({ icon, title, items, color, note }) {
     </div>
   );
 }
+export default function DenialAnalyzer() {
+  const [denialCode, setDenialCode] = useState("");
+  const [denialSearch, setDenialSearch] = useState("");
+  const [billedLines, setBilledLines] = useState([]);
+  const [deniedLines, setDeniedLines] = useState([]);
+  const [inputVal, setInputVal] = useState("");
+  const [mode, setMode] = useState("billed");
+  const [additionalContext, setAdditionalContext] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [showDropdown, setShowDropdown] = useState(false);
+  const inputRef = useRef(null);
+  const resultRef = useRef(null);
+
+  const selectedCode = DENIAL_CODES[denialCode.toUpperCase()] || null;
+  const filteredCodes = denialSearch.length >= 1
+    ? Object.entries(DENIAL_CODES).filter(([k, v]) =>
+        k.toLowerCase().includes(denialSearch.toLowerCase()) ||
+        v.label.toLowerCase().includes(denialSearch.toLowerCase()) ||
+        v.description.toLowerCase().includes(denialSearch.toLowerCase()) ||
+        v.category.toLowerCase().includes(denialSearch.toLowerCase())
+      ).slice(0, 12)
+    : [];
+
+  function parseEntry(raw) {
+    const parts = raw.trim().toUpperCase().split(/\s+/);
+    const cptMod = parts[0].split("-");
+    const cpt = cptMod[0];
+    const modifier = cptMod.slice(1).join("-") || "";
+    const dx = parts[1] || "";
+    if (!/^\d{4,5}[A-Z0-9]?$/.test(cpt) && !/^[A-Z]\d{2}/.test(cpt)) return null;
+    return { cpt, modifier, dx, id: Date.now() + Math.random() };
+  }
+
+  function handleAdd() {
+    setError("");
+    if (!inputVal.trim()) return;
+    const parsed = parseEntry(inputVal);
+    if (!parsed) {
+      setError("Format: CPT  or  CPT-MODIFIER  or  CPT-MODIFIER ICD10  (e.g. 99213  or  27447-59  or  27447-59 M54.5)");
+      return;
+    }
+    if (mode === "billed") setBilledLines(l => [...l, parsed]);
+    else setDeniedLines(l => [...l, parsed]);
+    setInputVal("");
+    inputRef.current?.focus();
+  }
+
+  async function runAnalysis() {
+    setError("");
+    if (!denialCode) { setError("Please select a denial code first."); return; }
+    if (deniedLines.length === 0) { setError("Please add at least one denied CPT code."); return; }
+    setLoading(true);
+    setResult(null);
+
+    const codeInfo = DENIAL_CODES[denialCode.toUpperCase()];
+    const billedStr = billedLines.length > 0
+      ? billedLines.map(l => `${l.cpt}${l.modifier ? "-" + l.modifier : ""}${l.dx ? " [" + l.dx + "]" : ""}`).join(", ")
+      : "Not provided";
+    const deniedStr = deniedLines.map(l => `${l.cpt}${l.modifier ? "-" + l.modifier : ""}${l.dx ? " [" + l.dx + "]" : ""}`).join(", ");
+
+    try {
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          denialCode,
+          denialCategory: codeInfo?.category,
+          denialDescription: codeInfo?.description,
+          billedStr,
+          deniedStr,
+          additionalContext,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Analysis failed");
+      setResult({ ai: data, codeInfo, denialCode });
+    } catch (err) {
+      setError(err.message || "Analysis failed. Please try again.");
+    }
+
+    setLoading(false);
+    setTimeout(() => resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 150);
+  }
+
+  function reset() {
+    setDenialCode(""); setDenialSearch(""); setBilledLines([]); setDeniedLines([]);
+    setInputVal(""); setResult(null); setError(""); setAdditionalContext(""); setMode("billed");
+  }
+
+  const ai = result?.ai;
+  const isFalse = ai?.verdict === "FALSE" || ai?.verdict === "LIKELY_FALSE";
+  const isTrue  = ai?.verdict === "TRUE"  || ai?.verdict === "LIKELY_TRUE";
+  const vc = ai?.verdict === "FALSE" ? "#22c55e" : ai?.verdict === "LIKELY_FALSE" ? "#86efac" : ai?.verdict === "TRUE" ? "#ef4444" : "#f59e0b";
+  const vl = ai?.verdict === "TRUE" ? "TRUE DENIAL" : ai?.verdict === "FALSE" ? "FALSE DENIAL" : ai?.verdict === "LIKELY_TRUE" ? "LIKELY TRUE DENIAL" : "LIKELY FALSE DENIAL";
+  const vi = isFalse ? "✅" : ai?.verdict === "TRUE" ? "❌" : "⚠️";
+
+  return (
+    <>
+      <Head>
+        <title>Medical Billing Denial Analyzer</title>
+        <meta name="description" content="AI-powered medical billing denial analyzer covering all CARC and RARC codes." />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+      </Head>
+
+      <div style={{ minHeight:"100vh", background:DARK, fontFamily:"'Segoe UI',system-ui,sans-serif", padding:"20px 14px 48px" }}>
+        <div style={{ maxWidth:800, margin:"0 auto" }}>
+
+          <div style={{ textAlign:"center", marginBottom:24 }}>
+            <div style={{ display:"inline-flex", alignItems:"center", gap:7, background:"rgba(56,189,248,0.08)", border:"1px solid rgba(56,189,248,0.2)", borderRadius:999, padding:"4px 14px", marginBottom:12 }}>
+              <span style={{ width:6, height:6, borderRadius:"50%", background:ACCENT, display:"inline-block" }}/>
+              <span style={{ fontSize:11, color:ACCENT, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase" }}>AI-Powered · All CARC & RARC Codes</span>
+            </div>
+            <h1 style={{ margin:"0 0 6px", fontSize:28, fontWeight:800, color:"#e8f4ff", letterSpacing:"-0.02em" }}>
+              Medical Billing Denial <span style={{ color:ACCENT }}>Analyzer</span>
+            </h1>
+            <p style={{ margin:0, color:"#4a6a8a", fontSize:13, maxWidth:460, marginLeft:"auto", marginRight:"auto" }}>
+              Select any denial code · Enter CPT codes · Get instant AI verdict with exact next steps
+            </p>
+          </div>
+
+          <div style={{ background:CARD, border:`1px solid ${BORDER}`, borderRadius:16, padding:"20px", marginBottom:12 }}>
+
+            <div style={{ marginBottom:16 }}>
+              <div style={{ fontSize:11, fontWeight:700, color:"#3a5a7a", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:8, display:"flex", alignItems:"center", gap:7 }}>
+                <span style={{ background:ACCENT, color:DARK, borderRadius:"50%", width:17, height:17, display:"inline-flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:800 }}>1</span>
+                Denial Code (CARC or RARC)
+              </div>
+              <div style={{ position:"relative" }}>
+                <input value={denialSearch}
+                  onChange={e => { setDenialSearch(e.target.value); setShowDropdown(true); }}
+                  onFocus={() => setShowDropdown(true)}
+                  onBlur={() => setTimeout(() => setShowDropdown(false), 200)}
+                  placeholder="Type code or keyword... e.g. CO-59, CO-50, auth, timely filing, duplicate"
+                  style={{ width:"100%", padding:"10px 13px", borderRadius:8, border:`2px solid ${selectedCode ? selectedCode.color+"60" : BORDER}`, background:"#0a1525", color:"#d0e8ff", fontSize:13, fontFamily:"monospace", outline:"none", boxSizing:"border-box" }}
+                />
+                {showDropdown && filteredCodes.length > 0 && (
+                  <div style={{ position:"absolute", top:"calc(100% + 4px)", left:0, right:0, background:CARD2, border:`1px solid ${BORDER}`, borderRadius:10, zIndex:200, boxShadow:"0 16px 40px rgba(0,0,0,0.6)", maxHeight:260, overflowY:"auto" }}>
+                    {filteredCodes.map(([key, val]) => (
+                      <div key={key}
+                        onClick={() => { setDenialCode(key); setDenialSearch(`${key} — ${val.label}`); setShowDropdown(false); }}
+                        style={{ padding:"9px 13px", cursor:"pointer", display:"flex", alignItems:"center", gap:9, borderBottom:`1px solid ${BORDER}` }}
+                        onMouseEnter={e => e.currentTarget.style.background = "#1a2d47"}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                        <span style={{ fontSize:14, flexShrink:0 }}>{val.icon}</span>
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+                            <span style={{ fontFamily:"monospace", fontWeight:700, fontSize:12, color:val.color }}>{key}</span>
+                            <span style={{ fontSize:12, color:"#c8d8ea" }}>{val.label}</span>
+                          </div>
+                          <div style={{ fontSize:11, color:"#3a5a7a", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{val.description}</div>
+                        </div>
+                        <span style={{ fontSize:10, color:val.color, background:`${val.color}15`, borderRadius:4, padding:"2px 6px", fontWeight:700, flexShrink:0, whiteSpace:"nowrap" }}>{val.category}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {selectedCode && (
+                <div style={{ marginTop:8, display:"flex", alignItems:"center", gap:9, padding:"8px 13px", borderRadius:8, background:`${selectedCode.color}10`, border:`1.5px solid ${selectedCode.color}40` }}>
+                  <span style={{ fontSize:18 }}>{selectedCode.icon}</span>
+                  <div style={{ flex:1 }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:7, flexWrap:"wrap" }}>
+                      <span style={{ fontFamily:"monospace", fontWeight:800, fontSize:13, color:selectedCode.color }}>{denialCode}</span>
+                      <span style={{ fontSize:13, color:"#c8d8ea", fontWeight:600 }}>{selectedCode.label}</span>
+                      <span style={{ fontSize:10, color:selectedCode.color, background:`${selectedCode.color}20`, borderRadius:4, padding:"2px 7px", fontWeight:700 }}>{selectedCode.category}</span>
+                    </div>
+                    <div style={{ fontSize:11, color:"#4a6a8a", marginTop:2 }}>{selectedCode.description}</div>
+                  </div>
+                  <button onClick={() => { setDenialCode(""); setDenialSearch(""); }} style={{ background:"none", border:"none", color:"#3a5a7a", cursor:"pointer", fontSize:16 }}>×</button>
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginBottom:14 }}>
+              <div style={{ fontSize:11, fontWeight:700, color:"#3a5a7a", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:8, display:"flex", alignItems:"center", gap:7 }}>
+                <span style={{ background:ACCENT, color:DARK, borderRadius:"50%", width:17, height:17, display:"inline-flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:800 }}>2</span>
+                CPT Codes
+              </div>
+              <div style={{ display:"flex", gap:7, marginBottom:10 }}>
+                {[["billed","✓ Billed CPTs","All codes on the claim"],["denied","✗ Denied CPT(s)","Codes that got this denial"]].map(([m,lbl,hint]) => (
+                  <button key={m} onClick={() => setMode(m)}
+                    style={{ flex:1, padding:"8px 12px", borderRadius:8, border:`2px solid ${mode===m?(m==="denied"?"rgba(239,68,68,0.5)":ACCENT+"80"):BORDER}`, background:mode===m?(m==="denied"?"rgba(239,68,68,0.08)":"rgba(56,189,248,0.06)"):"transparent", cursor:"pointer", textAlign:"left" }}>
+                    <div style={{ fontSize:12, fontWeight:700, color:mode===m?(m==="denied"?"#f87171":ACCENT):"#3a5a7a" }}>{lbl}</div>
+                    <div style={{ fontSize:11, color:"#2a4a6a" }}>{hint}</div>
+                  </button>
+                ))}
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                <input ref={inputRef} value={inputVal}
+                  onChange={e => setInputVal(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && handleAdd()}
+                  placeholder={mode === "billed" ? "e.g. 99213  or  27447-25  or  27447-25 M54.5" : "e.g. 27446  or  27446-59  or  27446 M17.11"}
+                  style={{ flex:1, padding:"10px 12px", borderRadius:8, border:`2px solid ${BORDER}`, background:"#0a1525", color:"#d0e8ff", fontSize:13, fontFamily:"monospace", outline:"none", boxSizing:"border-box" }}
+                />
+                <button onClick={handleAdd}
+                  style={{ padding:"10px 16px", borderRadius:8, border:"none", background:mode==="denied"?"rgba(239,68,68,0.15)":"rgba(56,189,248,0.12)", color:mode==="denied"?"#f87171":ACCENT, fontSize:12, fontWeight:700, cursor:"pointer", whiteSpace:"nowrap" }}>
+                  {mode === "billed" ? "+ Billed" : "+ Denied"}
+                </button>
+              </div>
+              <div style={{ fontSize:11, color:"#2a4a6a", marginTop:5 }}>CPT · CPT-MODIFIER · CPT-MODIFIER ICD10 — press Enter to add</div>
+              {error && <div style={{ marginTop:7, fontSize:12, color:"#f87171", background:"rgba(239,68,68,0.07)", border:"1px solid rgba(239,68,68,0.2)", borderRadius:7, padding:"6px 11px" }}>{error}</div>}
+            </div>
+
+            {(billedLines.length > 0 || deniedLines.length > 0) && (
+              <div style={{ borderTop:`1px solid ${BORDER}`, paddingTop:11, marginBottom:12 }}>
+                {billedLines.length > 0 && (
+                  <div style={{ marginBottom:7 }}>
+                    <span style={{ fontSize:10, fontWeight:700, color:"#3a5a7a", textTransform:"uppercase", letterSpacing:"0.07em", display:"block", marginBottom:4 }}>Billed ({billedLines.length})</span>
+                    {billedLines.map(l => (
+                      <Tag key={l.id} color="#38bdf8"
+                        label={`${l.cpt}${l.modifier?"-"+l.modifier:""}${l.dx?" ["+l.dx+"]":""}`}
+                        onRemove={() => setBilledLines(ls => ls.filter(x => x.id !== l.id))} />
+                    ))}
+                  </div>
+                )}
+                {deniedLines.length > 0 && (
+                  <div>
+                    <span style={{ fontSize:10, fontWeight:700, color:"#3a5a7a", textTransform:"uppercase", letterSpacing:"0.07em", display:"block", marginBottom:4 }}>Denied ({deniedLines.length})</span>
+                    {deniedLines.map(l => (
+                      <Tag key={l.id} color="#f87171"
+                        label={`${l.cpt}${l.modifier?"-"+l.modifier:""}${l.dx?" ["+l.dx+"]":""}`}
+                        onRemove={() => setDeniedLines(ls => ls.filter(x => x.id !== l.id))} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ marginBottom:14 }}>
+              <div style={{ fontSize:11, fontWeight:700, color:"#3a5a7a", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:6, display:"flex", alignItems:"center", gap:7 }}>
+                <span style={{ background:"#1a2d47", color:"#3a5a7a", borderRadius:"50%", width:17, height:17, display:"inline-flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:800 }}>3</span>
+                Additional Context
+                <span style={{ fontWeight:400, color:"#2a4a6a", textTransform:"none", fontSize:11 }}>(optional)</span>
+              </div>
+              <textarea value={additionalContext} onChange={e => setAdditionalContext(e.target.value)} rows={2}
+                placeholder="e.g. Auth was obtained, payer is Medicare, modifier -25 was on claim..."
+                style={{ width:"100%", padding:"9px 12px", borderRadius:8, border:`2px solid ${BORDER}`, background:"#0a1525", color:"#8a9baa", fontSize:12, outline:"none", resize:"vertical", boxSizing:"border-box", lineHeight:1.5 }} />
+            </div>
+
+            <div style={{ display:"flex", gap:9 }}>
+              <button onClick={runAnalysis} disabled={loading}
+                style={{ flex:1, padding:"12px", borderRadius:10, border:"none", background:loading?"#0f1929":`linear-gradient(135deg,${ACCENT},#0284c7)`, color:loading?"#3a5a7a":"#03111f", fontSize:14, fontWeight:800, cursor:loading?"not-allowed":"pointer", boxShadow:loading?"none":"0 4px 18px rgba(56,189,248,0.2)" }}>
+                {loading ? "🔍  Analyzing..." : "⚡  Analyze — True or False Denial?"}
+              </button>
+              {(billedLines.length>0||deniedLines.length>0||denialCode||result) && (
+                <button onClick={reset} style={{ padding:"12px 15px", borderRadius:10, border:`1.5px solid ${BORDER}`, background:"transparent", color:"#3a5a7a", fontSize:12, fontWeight:600, cursor:"pointer" }}>Reset</button>
+              )}
+            </div>
+          </div>
+
+          {loading && (
+            <div style={{ background:CARD, border:`1px solid ${BORDER}`, borderRadius:16, padding:"28px 20px", textAlign:"center" }}>
+              <div style={{ fontSize:28, marginBottom:10 }}>🔬</div>
+              <div style={{ fontSize:14, color:"#7a9bbf", fontWeight:600, marginBottom:5 }}>Reviewing {denialCode} rules & claim details…</div>
+              <div style={{ fontSize:12, color:"#2a4a6a" }}>Checking payer policy · Evaluating CPTs · Assessing appeal options</div>
+              <div style={{ display:"flex", justifyContent:"center", gap:7, marginTop:14 }}>
+                {[0,0.2,0.4].map((d,i) => (
+                  <div key={i} style={{ width:8, height:8, borderRadius:"50%", background:ACCENT, animation:`pulse2 1.2s ${d}s infinite` }}/>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {result && !loading && ai && (
+            <div ref={resultRef}>
+              <div style={{ background:CARD, border:`1.5px solid ${vc}35`, borderRadius:16, padding:"18px 20px", marginBottom:11, position:"relative", overflow:"hidden" }}>
+                <div style={{ position:"absolute", top:0, left:0, right:0, height:3, background:`linear-gradient(90deg,${vc},transparent)` }}/>
+                <div style={{ display:"flex", alignItems:"center", gap:14 }}>
+                  <span style={{ fontSize:36 }}>{vi}</span>
+                  <div style={{ flex:1 }}>
+                    <div style={{ fontSize:11, fontWeight:700, color:"#3a5a7a", textTransform:"uppercase", letterSpacing:"0.09em", marginBottom:3 }}>Denial Analysis — {result.denialCode}</div>
+                    <div style={{ fontSize:22, fontWeight:800, color:vc, marginBottom:3 }}>{vl}</div>
+                    {ai.verdictSummary && <p style={{ margin:0, fontSize:13, color:"#7a9bbf", lineHeight:1.6 }}>{ai.verdictSummary}</p>}
+                  </div>
+                  <div style={{ textAlign:"center", flexShrink:0 }}>
+                    <div style={{ fontSize:10, color:"#3a5a7a", fontWeight:700, textTransform:"uppercase", letterSpacing:"0.07em", marginBottom:5 }}>Confidence</div>
+                    <div style={{ position:"relative", width:64, height:64 }}>
+                      <svg width="64" height="64" viewBox="0 0 64 64">
+                        <circle cx="32" cy="32" r="26" fill="none" stroke={BORDER} strokeWidth="6"/>
+                        <circle cx="32" cy="32" r="26" fill="none" stroke={vc} strokeWidth="6"
+                          strokeDasharray={`${2*Math.PI*26}`}
+                          strokeDashoffset={`${2*Math.PI*26*(1-(ai.confidence||70)/100)}`}
+                          strokeLinecap="round" transform="rotate(-90 32 32)"/>
+                      </svg>
+                      <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, fontWeight:800, color:vc, fontFamily:"monospace" }}>
+                        {ai.confidence||70}%
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ background:CARD, border:`1px solid ${BORDER}`, borderRadius:16, padding:"18px 20px" }}>
+                {ai.denialRuleExplained && (
+                  <div style={{ background:"rgba(56,189,248,0.06)", border:"1.5px solid rgba(56,189,248,0.2)", borderRadius:11, padding:"13px 15px", marg
