@@ -406,7 +406,7 @@ export default function DenialAnalyzer() {
               </div>
 
               <div style={{ background:CARD, border:`1px solid ${BORDER}`, borderRadius:16, padding:"18px 20px" }}>
-                {ai.denialRuleExplained && <div style={{ background:"rgba(56,189,248,0.06)", border:"1.5px solid rgba(56,189,248,0.2)", borderRadius:11, padding:"13px 15px", marginBottom:11 }}>
+                {ai.denialRuleExplained && (<div style={{ background:"rgba(56,189,248,0.06)", border:"1.5px solid rgba(56,189,248,0.2)", borderRadius:11, padding:"13px 15px", marginBottom:11 }}>
                     <div style={{ fontSize:11, fontWeight:700, color:ACCENT, textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:7 }}>📖 What {result.denialCode} Means</div>
                     <p style={{ margin:0, fontSize:13, color:"#a0bcce", lineHeight:1.7 }}>{ai.denialRuleExplained}</p>
                   </div>
