@@ -26,39 +26,59 @@ ${additionalContext ? `- Additional Context: ${additionalContext}` : ""}
 
 Determine if this is a TRUE denial (valid) or FALSE denial (should be paid). Provide specific actionable guidance.
 
-Respond ONLY in this exact JSON (no markdown, no extra text):
+Respond ONLY in this exact JSON structure:
 {"verdict":"TRUE|FALSE|LIKELY_TRUE|LIKELY_FALSE","confidence":0-100,"verdictSummary":"one clear sentence","denialRuleExplained":"plain english explanation of ${denialCode}","whyTrueDenial":[],"whyFalseDenial":[],"billingErrors":[],"correctiveActions":[],"appealSteps":[],"modifierGuidance":"advice or null","documentationNeeded":[],"preventionTips":[],"timingAdvice":"deadline note","escalationPath":"if appeal fails what next"}`;
 
+  // Use the 2.5-flash-lite endpoint for the best balance of stability and free-tier limits in 2026
+  const modelEndpoint = "gemini-2.5-flash-lite"; 
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelEndpoint}:generateContent?key=${apiKey}`;
+
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: 1500,
-          },
-        }),
-      }
-    );
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1, // Lower temperature for more consistent medical logic
+          maxOutputTokens: 2000,
+          response_mime_type: "application/json", // Forces Gemini to return pure JSON without markdown
+        },
+      }),
+    });
 
     if (!response.ok) {
-      const err = await response.text();
-      console.error("Gemini error:", err);
-      return res.status(500).json({ error: "Gemini API error" });
+      const errText = await response.text();
+      console.error("Gemini API direct error:", errText);
+
+      // Specific handling for Free Tier Rate Limits (Error 429)
+      if (response.status === 429) {
+        return res.status(429).json({ error: "Daily limit or rate limit reached. Please wait a minute." });
+      }
+
+      return res.status(response.status).json({ error: "Gemini API failed to respond." });
     }
 
     const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const clean = text.replace(/```json|```/g, "").trim();
-    const result = JSON.parse(clean);
+    
+    // Safety check: sometimes the API responds but candidates is empty due to safety filters
+    if (!data.candidates || data.candidates.length === 0) {
+      return res.status(500).json({ error: "The AI blocked this response due to safety filters. Try simplifying your context." });
+    }
 
-    return res.status(200).json(result);
+    const resultText = data.candidates[0].content.parts[0].text;
+
+    try {
+      // With response_mime_type enabled, resultText is guaranteed to be a stringified JSON object
+      const result = JSON.parse(resultText);
+      return res.status(200).json(result);
+    } catch (parseErr) {
+      console.error("Failed to parse Gemini output:", resultText);
+      return res.status(500).json({ error: "The AI returned an invalid response format." });
+    }
+
   } catch (err) {
-    console.error("Parse/fetch error:", err);
-    return res.status(500).json({ error: "Failed to analyze denial. Please try again." });
+    console.error("Critical server error:", err);
+    return res.status(500).json({ error: "Internal server error. Please try again later." });
   }
 }
