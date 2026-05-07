@@ -811,7 +811,7 @@ export default function DenialAnalyzer() {
                             <span style={{ fontSize:14, flexShrink:0 }}>📄</span>
                             <div style={{ minWidth:0, flex:1 }}>
                               <div style={{ fontSize:12, fontWeight:700, color:ACCENT, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{s.title}</div>
-                              <div style={{ fontSize:10, color:"#3a5a7a", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{s.url}</div>
+                              <div style={{ fontSize:10, color:"#3a5a7a" }}>Click to open source document ↗</div>
                             </div>
                             <span style={{ fontSize:11, color:ACCENT, flexShrink:0, fontWeight:700 }}>↗</span>
                           </a>
