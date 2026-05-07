@@ -17,11 +17,11 @@ export default async function handler(req, res) {
   const systemInstruction = `You are a senior certified medical billing compliance specialist with deep expertise in CARC/RARC denial codes, NCCI edits, payer policies, and appeals.
 
 VERDICT CRITERIA — YOU MUST FOLLOW THESE EXACTLY:
-- Use "TRUE" ONLY when: a universally applicable, well-established CMS or AMA rule clearly supports the denial AND you can cite the exact rule in whyTrueDenial. Examples: confirmed NCCI PTP bundle with no modifier, patient responsibility codes (CO-1/2/3) which are always valid, timely filing clearly exceeded under Medicare's standard 12-month rule.
+- Use "TRUE" ONLY when: a universally applicable, well-established CMS or AMA rule clearly supports the denial AND you can cite the exact rule in whyTrueDenial. Examples: confirmed NCCI PTP bundle[...]
 - Use "LIKELY_TRUE" when: general billing guidelines support the denial but payer-specific contract terms, documentation review, or modifier usage could change the outcome.
 - Use "LIKELY_FALSE" when: there is a documentable, rule-based reason the denial appears incorrect, but full confirmation requires payer verification or claim detail you do not have.
 - Use "FALSE" ONLY when: a clear, universally applicable rule makes the denial definitively incorrect AND you can cite it precisely. This is rare without full claim and contract details.
-- Use "CANNOT_DETERMINE" when: the verdict fundamentally depends on payer-specific contract terms, clinical documentation content, or current quarterly NCCI edit tables that you cannot access. Do not guess in these cases.
+- Use "CANNOT_DETERMINE" when: the verdict fundamentally depends on payer-specific contract terms, clinical documentation content, or current quarterly NCCI edit tables that you cannot access. Do [...]
 
 CONFIDENCE SCORE RULES:
 - TRUE or FALSE verdict: max confidence 85 — you never have full claim context
@@ -31,21 +31,21 @@ CONFIDENCE SCORE RULES:
 
 ANTI-HALLUCINATION RULES — FOLLOW STRICTLY:
 1. Do NOT fabricate payer-specific phone numbers, fax numbers, portal URLs, or mailing addresses. If you do not know them with certainty, omit them entirely.
-2. For "timingAdvice": if you are not certain of the exact timely filing or appeal deadline for this specific payer and denial type, respond with "Verify the exact deadline directly with the payer or in your provider agreement — do not rely on this estimate." Do NOT invent a specific number of days.
-3. For "escalationPath": describe the general escalation process (e.g., internal appeal → external review → state insurance commissioner) without fabricating specific contacts, case numbers, or addresses.
+2. For "timingAdvice": if you are not certain of the exact timely filing or appeal deadline for this specific payer and denial type, respond with "Verify the exact deadline directly with the payer[...]
+3. For "escalationPath": describe the general escalation process (e.g., internal appeal → external review → state insurance commissioner) without fabricating specific contacts, case numbers, o[...]
 4. For "appealSteps": provide general procedurally accurate steps. Do not cite specific payer portal URLs or phone numbers unless you are certain they are correct.
 5. For "modifierGuidance": only reference CMS-defined modifiers (e.g., -59, -25, -PT, -76). Do not invent modifier rules.
 6. If you are unsure about any claim, say so explicitly rather than guessing with false confidence.
-7. For Medical Necessity denials (CO-50, CO-20, CO-51, CO-76, CO-186, CO-228, CO-243, CO-244, CO-256): explicitly state in "whyTrueDenial" or "whyFalseDenial" whether a Local Coverage Determination (LCD) or National Coverage Determination (NCD) likely governs the denied CPT code. Use the format: "Check the LCD/NCD for CPT [code] — it defines the covered diagnoses and documentation requirements for this service." If an NCD is known to exist for the procedure (e.g., colonoscopy screenings, sleep studies), name it explicitly. Do not fabricate LCD article numbers or contractor names.
+7. For Medical Necessity denials (CO-50, CO-20, CO-51, CO-76, CO-186, CO-228, CO-243, CO-244, CO-256): explicitly state in "whyTrueDenial" or "whyFalseDenial" whether a Local Coverage Determinatio[...]
 8. For NCCI bundling denials (CO-97, CO-59, CO-96, CO-78, CO-231, CO-4) — FOLLOW THIS EXACTLY OR YOUR VERDICT WILL BE WRONG:
 - The DENIED CPT code is always the Column 2 (component/inclusive) code. The PAID/BILLED code is the Column 1 (comprehensive) code.
-- CO-97 (Payment included in another service): The denied code is bundled INTO the paid code. If the denied code is a subset or component of the comprehensive paid code, the denial is CORRECT — return LIKELY_TRUE or TRUE. Do NOT reason that "the paid code is more extensive therefore the denial is wrong" — that is backwards. The whole point of bundling is that the component is already included in the comprehensive code's reimbursement.
-- CO-59 (Procedure not bundled with another): Denial issued because payer believes these should be billed separately. Assess whether a distinct procedural service modifier (-59, -XS, -XE, -XP, -XU) was present and whether the services were truly clinically distinct.
+- CO-97 (Payment included in another service): The denied code is bundled INTO the paid code. If the denied code is a subset or component of the comprehensive paid code, the denial is CORRECT — [...]
+- CO-59 (Procedure not bundled with another): Denial issued because payer believes these should be billed separately. Assess whether a distinct procedural service modifier (-59, -XS, -XE, -XP, -XU[...]
 - CO-96 (Non-covered charge): The payer's contract or plan excludes this service entirely. Assess whether a coverage exclusion or benefit limitation applies.
 - CO-78 (Unrelated procedure by same physician during post-op period): Assess whether the denied procedure is truly unrelated to the original surgery or falls within the global surgical period.
-- CO-231 (Mutually exclusive procedures): Two procedures cannot reasonably be performed at the same session (e.g., bilateral and unilateral version of the same service). Assess whether both were truly performed and documented as distinct.
+- CO-231 (Mutually exclusive procedures): Two procedures cannot reasonably be performed at the same session (e.g., bilateral and unilateral version of the same service). Assess whether both were t[...]
 - CO-4 (Procedure inconsistent with modifier): The modifier used does not support separate billing. Assess whether the modifier was clinically appropriate for the scenario.
-- For ALL NCCI denials: Only return LIKELY_FALSE or FALSE if (a) the two codes are clinically distinct services performed at different anatomical sites, different lesions, or clearly separate encounters AND (b) a valid NCCI modifier (-59, -XS, -XE, -XP, -XU) was present or clearly should have been. Never return FALSE solely because one code is more comprehensive than the other.`;
+- For ALL NCCI denials: Only return LIKELY_FALSE or FALSE if (a) the two codes are clinically distinct services performed at different anatomical sites, different lesions, or clearly separate enco[...]
 
   // ── Declare all flags BEFORE the prompt so they can be referenced inside it ──
   const isMedicalNecessity = ["CO-50","CO-20","CO-51","CO-76","CO-186","CO-228","CO-243","CO-244","CO-256"].includes(denialCode?.toUpperCase());
@@ -64,22 +64,22 @@ ${icd10Codes ? `- ICD-10 Diagnosis Code(s): ${icd10Codes}` : "- ICD-10 Diagnosis
 ${additionalContext ? `- Additional Context: ${additionalContext}` : ""}
 
 RARC INTERPRETATION RULE:
-When a RARC is provided alongside the CARC, the RARC defines the SPECIFIC reason for the denial. The CARC is the category — the RARC is the detail. Your entire analysis must be based on the CARC + RARC combination, not the CARC alone. For example: CO-16 alone means "claim lacks information" (vague). CO-16 + M76 means "claim denied specifically because diagnosis code is missing or invalid" — treat this as a diagnosis coding error, not a generic submission issue.
+When a RARC is provided alongside the CARC, the RARC defines the SPECIFIC reason for the denial. The CARC is the category — the RARC is the detail. Your entire analysis must be based on the CARC[...]
 
 ${isMedicalNecessity ? `MEDICAL NECESSITY VERDICT RULES:
 ${icd10Codes
-  ? `ICD-10 codes ARE provided (${icd10Codes}). You MUST assess whether these diagnosis codes represent a covered indication for the denied CPT code under general Medicare or commercial payer LCD/NCD standards. Provide a LIKELY_TRUE or LIKELY_FALSE verdict based on whether the diagnosis-to-procedure pairing is clinically appropriate and typically covered. Do not default to CANNOT_DETERMINE when ICD-10 codes are available — make a reasoned assessment and flag what documentation would confirm it.`
-  : `ICD-10 codes are NOT provided. You cannot assess medical necessity without knowing what diagnosis was billed. Return CANNOT_DETERMINE and clearly explain that the verdict requires ICD-10 diagnosis codes to evaluate coverage criteria. List in correctiveActions what the biller should do: retrieve the diagnosis codes from the claim and re-run the analysis.`
+  ? `ICD-10 codes ARE provided (${icd10Codes}). You MUST assess whether these diagnosis codes represent a covered indication for the denied CPT code under general Medicare or commercial payer LCD/[...]
+  : `ICD-10 codes are NOT provided. You cannot assess medical necessity without knowing what diagnosis was billed. Return CANNOT_DETERMINE and clearly explain that the verdict requires ICD-10 diag[...]
 }` : ""}
 
 ${isAuth ? `PRIOR AUTHORIZATION VERDICT RULES:
 ${payerName
-  ? `Payer IS provided (${payerName}). Use your search capability to look up ${payerName}'s current prior authorization requirements for the denied CPT code(s). Search for "${payerName} prior authorization requirements CPT ${deniedStr}" and "${payerName} clinical policy bulletin ${deniedStr}". Based on what you find: if the CPT code IS on ${payerName}'s auth required list and no auth was obtained, return LIKELY_TRUE. If the CPT code does NOT require auth under ${payerName}'s policy, return LIKELY_FALSE — this is a disputable denial. Cite the specific policy document found in your verdict reasoning.`
-  : `Payer name is NOT provided. You cannot search for payer-specific auth requirements without knowing the payer. Return CANNOT_DETERMINE and instruct the biller to re-run the analysis with the payer name entered — this will enable a targeted search of that payer's clinical policies and auth requirement lists.`
+  ? `Payer IS provided (${payerName}). Use your search capability to look up ${payerName}'s current prior authorization requirements for the denied CPT code(s). Search for "${payerName} prior auth[...]
+  : `Payer name is NOT provided. You cannot search for payer-specific auth requirements without knowing the payer. Return CANNOT_DETERMINE and instruct the biller to re-run the analysis with the p[...]
 }` : ""}
 
 ${isNcci ? `NCCI BUNDLING ANALYSIS RULES:
-You MUST use the word "NCCI" explicitly in every item you place in whyTrueDenial, whyFalseDenial, billingErrors, correctiveActions, and appealSteps — this is required so the user interface can detect it and display verification links. Do not paraphrase "NCCI" as "bundling edit" or "edit table" alone — always say "NCCI edit" or "NCCI bundling".
+You MUST use the word "NCCI" explicitly in every item you place in whyTrueDenial, whyFalseDenial, billingErrors, correctiveActions, and appealSteps — this is required so the user interface can d[...]
 - Search the current CMS NCCI PTP edit tables for the CPT pair: billed code(s) ${billedStr} vs denied code(s) ${deniedStr}.
 - Identify which code is Column 1 (comprehensive/pays) and which is Column 2 (component/denied). State this explicitly in your whyTrueDenial or whyFalseDenial.
 - State whether a modifier indicator of 0 (modifier not allowed) or 1 (modifier allowed) applies to this NCCI edit pair.
@@ -91,7 +91,7 @@ You MUST use the word "NCCI" explicitly in every item you place in whyTrueDenial
 Determine if this is a TRUE denial (valid) or FALSE denial (should be paid). Provide specific actionable guidance.
 
 Respond ONLY in this exact JSON structure:
-{"verdict":"TRUE|FALSE|LIKELY_TRUE|LIKELY_FALSE|CANNOT_DETERMINE","confidence":0-85,"verdictSummary":"one clear sentence explaining the verdict or why it cannot be determined","denialRuleExplained":"plain english explanation of ${denialCode}${rarcCode ? ` with remark code ${rarcCode}` : ""}","whyTrueDenial":[],"whyFalseDenial":[],"billingErrors":[],"correctiveActions":[],"appealSteps":[],"modifierGuidance":"advice or null","documentationNeeded":[],"preventionTips":[],"timingAdvice":"deadline note or uncertainty disclaimer per rules","escalationPath":"general escalation process without fabricated contacts"}`;
+{"verdict":"TRUE|FALSE|LIKELY_TRUE|LIKELY_FALSE|CANNOT_DETERMINE","confidence":0-85,"verdictSummary":"one clear sentence explaining the verdict or why it cannot be determined","denialRuleExplained[...]
 
   // Grounding fires for:
   // - Medical necessity when ICD-10 codes provided (reads live LCD/NCD from CMS)
@@ -120,13 +120,54 @@ Respond ONLY in this exact JSON structure:
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+
+    // ========== ENHANCED ERROR HANDLING START ==========
+    // Log response status and headers for debugging
+    console.log(`[Gemini API Call] Status: ${r.status}, Content-Type: ${r.headers.get("content-type")}`);
+
     if (!r.ok) {
       const errText = await r.text();
-      console.error("Gemini API error:", r.status, errText);
-      if (r.status === 429) throw { status: 429, message: "Daily limit or rate limit reached. Please wait a minute." };
-      throw { status: r.status, message: "Gemini API failed to respond." };
+      console.error("Gemini API error response:", {
+        status: r.status,
+        statusText: r.statusText,
+        contentType: r.headers.get("content-type"),
+        bodyPreview: errText.slice(0, 500),
+        isHtml: errText.includes("<!DOCTYPE") || errText.includes("<html"),
+      });
+
+      if (r.status === 429) {
+        throw { status: 429, message: "Daily limit or rate limit reached. Please wait a minute." };
+      }
+      if (r.status === 401 || r.status === 403) {
+        throw { status: r.status, message: "API key invalid or unauthorized. Check GEMINI_API_KEY environment variable." };
+      }
+      throw { status: r.status, message: `Gemini API failed with status ${r.status}. Response: ${errText.slice(0, 200)}` };
     }
-    return r.json();
+
+    // Check Content-Type before parsing JSON
+    const contentType = r.headers.get("content-type");
+    if (!contentType?.includes("application/json")) {
+      const bodyText = await r.text();
+      console.error("Unexpected content type:", {
+        contentType,
+        bodyPreview: bodyText.slice(0, 500),
+        isHtml: bodyText.includes("<!DOCTYPE") || bodyText.includes("<html"),
+      });
+      throw { status: 500, message: `Expected JSON but got ${contentType}. Response was not valid JSON.` };
+    }
+
+    try {
+      return await r.json();
+    } catch (jsonErr) {
+      const bodyText = await r.text();
+      console.error("JSON parsing failed:", {
+        error: jsonErr.message,
+        bodyPreview: bodyText.slice(0, 500),
+        isHtml: bodyText.includes("<!DOCTYPE") || bodyText.includes("<html"),
+      });
+      throw { status: 500, message: "API returned invalid JSON. Please try again." };
+    }
+    // ========== ENHANCED ERROR HANDLING END ==========
   }
 
   function extractJson(text) {
