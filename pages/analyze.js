@@ -1,0 +1,674 @@
+// ── CMS coverage lookup helpers (medical-necessity / LCD-NCD denials) ──
+const US_STATES = {
+  AL:"alabama",AK:"alaska",AZ:"arizona",AR:"arkansas",CA:"california",CO:"colorado",CT:"connecticut",
+  DE:"delaware",DC:"district of columbia",FL:"florida",GA:"georgia",HI:"hawaii",ID:"idaho",IL:"illinois",
+  IN:"indiana",IA:"iowa",KS:"kansas",KY:"kentucky",LA:"louisiana",ME:"maine",MD:"maryland",MA:"massachusetts",
+  MI:"michigan",MN:"minnesota",MS:"mississippi",MO:"missouri",MT:"montana",NE:"nebraska",NV:"nevada",
+  NH:"new hampshire",NJ:"new jersey",NM:"new mexico",NY:"new york",NC:"north carolina",ND:"north dakota",
+  OH:"ohio",OK:"oklahoma",OR:"oregon",PA:"pennsylvania",RI:"rhode island",SC:"south carolina",
+  SD:"south dakota",TN:"tennessee",TX:"texas",UT:"utah",VT:"vermont",VA:"virginia",WA:"washington",
+  WV:"west virginia",WI:"wisconsin",WY:"wyoming",PR:"puerto rico",
+};
+
+// Read the state off a free-text payer name ("Medicare of Georgia" -> "georgia").
+// Also flags Medicare Advantage (not FFS — LCDs are reference-only) and Railroad Medicare.
+function resolvePayerJurisdiction(payerName) {
+  const p = (payerName || "").toLowerCase();
+  if (!p) return { state: null, isMedicareAdvantage: false, isRailroad: false };
+  const isMedicareAdvantage = /\b(advantage|part c|hmo|ppo|humana|aetna|cigna|wellcare|devoted|elevance|anthem)\b/.test(p)
+    || /\b(uhc|united\s*health)\b.*\b(medicare|advantage)\b/.test(p);
+  const isRailroad = /railroad/.test(p);
+  let state = null;
+  for (const [ab, name] of Object.entries(US_STATES)) {
+    if (p.includes(name)) { state = name; break; }
+    if (new RegExp(`\\b${ab.toLowerCase()}\\b`).test(p)) state = state || name;
+  }
+  return { state, isMedicareAdvantage, isRailroad };
+}
+
+function firstCpt(str) {
+  const m = String(str || "").match(/\b([A-Z]?\d{4,5})\b/);
+  return m ? m[1].toUpperCase() : null;
+}
+function firstIcd(str) {
+  const m = String(str || "").match(/\b([A-Z]\d{2}(?:\.?\d{1,4})?)\b/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// Fail-soft: returns null on any error / missing config, so the caller falls back to grounded search.
+async function coverageLookup(state, cpt, icd10) {
+  const url = process.env.SUPABASE_URL, key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+  if (!url || !key || !state || !cpt) return null;
+  try {
+    const res = await fetch(`${url}/rest/v1/rpc/coverage_lookup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: key, Authorization: `Bearer ${key}` },
+      body: JSON.stringify({ p_state: state, p_cpt: cpt, p_icd10: icd10 || "" }),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows.length ? rows : null;
+  } catch { return null; }
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const { denialCode, denialCategory, denialDescription, billedStr, deniedStr, additionalContext, rarcCode, rarcDescription, icd10Codes, payerName, placeOfService, modifierDetail } = req.body;
+
+  if (!denialCode || !deniedStr) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: "API key not configured" });
+  }
+
+  const systemInstruction = `You are a senior certified medical billing compliance specialist with deep expertise in CARC/RARC denial codes, NCCI edits, payer policies, and appeals.
+
+VERDICT CRITERIA — YOU MUST FOLLOW THESE EXACTLY:
+- Use "TRUE" ONLY when: a universally applicable, well-established CMS or AMA rule clearly supports the denial AND you can cite the exact rule in whyTrueDenial. Examples: confirmed NCCI PTP bundle with no modifier, patient responsibility codes (CO-1/2/3) which are always valid, timely filing clearly exceeded under Medicare's standard 12-month rule.
+- Use "LIKELY_TRUE" when: general billing guidelines support the denial but payer-specific contract terms, documentation review, or modifier usage could change the outcome.
+- Use "LIKELY_FALSE" when: there is a documentable, rule-based reason the denial appears incorrect, but full confirmation requires payer verification or claim detail you do not have.
+- Use "FALSE" ONLY when: a clear, universally applicable rule makes the denial definitively incorrect AND you can cite it precisely. This is rare without full claim and contract details.
+- Use "CANNOT_DETERMINE" when: the verdict fundamentally depends on payer-specific contract terms, clinical documentation content, or current quarterly NCCI edit tables that you cannot access. Do not guess in these cases.
+
+CONFIDENCE SCORE RULES:
+- TRUE or FALSE verdict: max confidence 85 — you never have full claim context
+- LIKELY_TRUE or LIKELY_FALSE: max confidence 75
+- CANNOT_DETERMINE: confidence must be 0
+- Never return confidence above 85 under any circumstance
+
+ANTI-HALLUCINATION RULES — FOLLOW STRICTLY:
+1. Do NOT fabricate payer-specific phone numbers, fax numbers, portal URLs, or mailing addresses. If you do not know them with certainty, omit them entirely.
+2. For "timingAdvice": if you are not certain of the exact timely filing or appeal deadline for this specific payer and denial type, respond with "Verify the exact deadline directly with the payer or in your provider agreement — do not rely on this estimate." Do NOT invent a specific number of days.
+3. For "escalationPath": describe the general escalation process (e.g., internal appeal → external review → state insurance commissioner) without fabricating specific contacts, case numbers, or addresses.
+4. For "appealSteps": provide general procedurally accurate steps. Do not cite specific payer portal URLs or phone numbers unless you are certain they are correct.
+5. For "modifierGuidance": only reference CMS-defined modifiers (e.g., -59, -25, -PT, -76). Do not invent modifier rules.
+6. If you are unsure about any claim, say so explicitly rather than guessing with false confidence.
+7. For Medical Necessity denials (CO-50, CO-20, CO-51, CO-76, CO-186, CO-228, CO-243, CO-244, CO-256): you MUST populate the lcdNcdReference object in your JSON response.
+   - If grounding/search found a real LCD article number (format L#####) or NCD number (format ###.#): use it ONLY if the policy status is "Active" or "Final" — it is real, not fabricated.
+   - CRITICAL — NEVER cite a retired, withdrawn, superseded, or replaced LCD/NCD. These are void and citing them is incorrect. If your search returns a retired policy, search for its active replacement and use that instead. If no active replacement exists, set articleNumber to null.
+   - If grounding did NOT find a confirmed active article number: set articleNumber to null. Do NOT guess or invent article numbers or contractor names.
+   - Always set the type field to "LCD", "NCD", or "NONE" based on what you found.
+   - For well-known NCDs (colonoscopy, sleep studies, CPAP, mammography, etc.) you may include the NCD number from your training knowledge ONLY if you are highly certain the NCD is still active — flag it as "verify active status" in the summary.
+   - Always set the url field to the direct active article link (https://www.cms.gov/medicare-coverage-database/view/lcd.aspx?lcdId=XXXXX), never to a retired document.
+8. For Auth denials (CO-15, CO-17, CO-197, CO-198, CO-245, CO-246): you are ONLY permitted to state that a specific payer requires authorization for a specific CPT code if your Google Search tool returned a real policy document confirming it in this session. If you did not perform a search, or your search returned no usable policy document, you MUST set verdict to CANNOT_DETERMINE — never state what a specific payer "requires" or "does not require" based on training knowledge alone. Training data about payer policies is outdated and unreliable.
+9. For Coverage Denials (CO-96, CO-5, CO-182, CO-204, CO-233, CO-250): When a payer name and ICD-10 codes are provided, you MUST search for the payer's Clinical Policy Bulletin (CPB) for the denied CPT code. Many CO-96 denials are misclassified medical necessity denials — the service IS covered when medically necessary with the right documentation. If the CPB confirms coverage when medically necessary AND the ICD-10 supports medical necessity, return LIKELY_FALSE. If it is a confirmed hard plan exclusion with no coverage pathway, return LIKELY_TRUE. If no CPB is found for smaller or regional payers, return CANNOT_DETERMINE and instruct the biller to request the CPB directly. Do NOT fabricate CPB numbers, policy titles, or effective dates.`;
+
+  // ── Declare all flags BEFORE the prompt so they can be referenced inside it ──
+  const isMedicalNecessity = ["CO-50","CO-20","CO-51","CO-76","CO-186","CO-228","CO-243","CO-244","CO-256"].includes(denialCode?.toUpperCase());
+  const isNcci = ["CO-97","CO-59","CO-78","CO-231","CO-B15"].includes(denialCode?.toUpperCase());
+  const isAuth = ["CO-15","CO-17","CO-197","CO-198","CO-245","CO-246"].includes(denialCode?.toUpperCase());
+  const isCoverageDenial = ["CO-96","CO-5","CO-182","CO-204","CO-233","CO-250"].includes(denialCode?.toUpperCase());
+
+  // Modifier / coding-consistency denials (CO-4 "procedure inconsistent with the modifier",
+  // or any denial carrying a modifier-specific RARC). These get the grounded path + the
+  // dedicated modifier verdict logic below — previously they fell through to the weak default path.
+  const MODIFIER_RARCS = ["N56","N519","M78","M51","N657","M50"];
+  const isCodingModifier =
+    ["CO-4"].includes(denialCode?.toUpperCase()) ||
+    MODIFIER_RARCS.includes(rarcCode?.toUpperCase());
+
+  // True when NCCI quarterly-cycle currency is meaningful for this denial type.
+  const ncciRelevant = isNcci || isCodingModifier;
+
+  // True when ANY modifier is present on the denied/billed lines (any denial type).
+  // Prefer the structured detail from the client; fall back to scanning the CPT strings.
+  const hasModifier =
+    !!modifierDetail ||
+    /-[A-Z0-9]{2}(?:-[A-Z0-9]{2})*(?=[\s,\[]|$)/.test(`${deniedStr || ""} ${billedStr || ""}`);
+
+  // ── Authoritative CMS coverage check (medical-necessity / LCD-NCD denials) ──
+  // Resolve jurisdiction from the payer name, look up the real covered/non-covered
+  // ICD-10 list from the synced CMS data, and hand it to the model as ground truth.
+  // Fail-soft: if anything is missing it stays null and we fall back to grounded search.
+  const coverageRelevant = isMedicalNecessity || isCoverageDenial;
+  let coverageCheck = null, coverageBlock = "";
+  if (coverageRelevant) {
+    const jur = resolvePayerJurisdiction(payerName);
+    const cpt = firstCpt(deniedStr), icd = firstIcd(icd10Codes);
+    const rows = await coverageLookup(jur.state, cpt, icd);
+    if (rows || jur.isMedicareAdvantage) {
+      coverageCheck = {
+        state: jur.state, cpt, icd10: icd,
+        isMedicareAdvantage: jur.isMedicareAdvantage,
+        isRailroad: jur.isRailroad,
+        matches: rows || [],
+        snapshotNote: "Verify against current CMS coverage; data is a weekly snapshot.",
+      };
+      if (rows) {
+        const lines = rows.map(r => {
+          const q = r.match_quality;
+          const base = r.icd_status === "COVERED"
+            ? `ICD-10 ${icd} is on the COVERED list (supports medical necessity) for CPT ${cpt}`
+            : r.icd_status === "NONCOVERED"
+              ? `ICD-10 ${icd} is on the NON-covered list (does NOT support medical necessity) for CPT ${cpt}`
+              : `ICD-10 ${icd} is NOT linked to CPT ${cpt} in this policy`;
+          const conf = q === "GROUP"
+            ? " [CONFIRMED: same coverage group — authoritative]"
+            : q === "DIFFERENT_GROUP"
+              ? " [the ICD appears in this article but under a DIFFERENT procedure group than this CPT, so it does NOT establish coverage for this CPT — do not treat as covered]"
+              : " [co-listed in the article but the policy's group structure was not available, so this is unconfirmed — verify the article's groups before relying on it]";
+          return `• ${r.doc_type} ${r.display_id} "${r.title}": ${base}.${conf}`;
+        }).join("\n");
+        coverageBlock = `AUTHORITATIVE CMS COVERAGE DATA (use as ground truth — do NOT contradict a CONFIRMED group match with web/memory):
+Jurisdiction resolved from payer "${payerName}": ${jur.state}. From the synced CMS Medicare Coverage Database for this jurisdiction:
+${lines}
+${rows.find(r => r.doc_reqs) ? `Documentation requirements (from the LCD): ${rows.find(r => r.doc_reqs).doc_reqs}` : ""}
+How to use this: A CONFIRMED (same-group) COVERED means a medical-necessity denial is likely FALSE (payable) — guide toward appeal with the documentation above. A CONFIRMED NON-covered, or an ICD that is only in a DIFFERENT group, means the diagnosis does not establish necessity for this CPT — the denial is likely valid; guide toward correcting the diagnosis or an ABN path. For unconfirmed (co-listed only) matches, weigh it as supportive but tell the biller to verify.${jur.isMedicareAdvantage ? "\nNOTE: payer appears to be a Medicare ADVANTAGE plan — treat the LCD/NCD as a strong reference, NOT a binding rule." : ""}
+
+`;
+      } else if (jur.isMedicareAdvantage) {
+        coverageBlock = `NOTE ON PAYER: "${payerName}" appears to be a Medicare Advantage plan (not fee-for-service Medicare). LCD/NCD coverage rules are a strong reference but are not strictly binding on MA plans — frame coverage guidance accordingly.
+
+`;
+      }
+    }
+  }
+
+  const prompt = `${coverageBlock}DENIAL INFORMATION:
+- CARC (Denial Code): ${denialCode}
+- Denial Category: ${denialCategory || "Unknown"}
+- Denial Description: ${denialDescription || "Unknown"}
+${rarcCode ? `- RARC (Remark Code): ${rarcCode}${rarcDescription ? ` — ${rarcDescription}` : " (not in local dictionary — interpret based on your knowledge)"}` : "- RARC: Not provided"}
+- Payer: ${payerName || "Not provided"}
+- Place of Service (POS): ${placeOfService ? `POS ${placeOfService}` : "Not provided"}
+- All Billed CPT Codes: ${billedStr || "Not provided"}
+- Denied CPT Code(s): ${deniedStr}
+${icd10Codes ? `- ICD-10 Diagnosis Code(s): ${icd10Codes}` : "- ICD-10 Diagnosis Code(s): Not provided"}
+${additionalContext ? `- Additional Context: ${additionalContext}` : ""}
+
+RARC INTERPRETATION RULE:
+When a RARC is provided alongside the CARC, the RARC defines the SPECIFIC reason for the denial. The CARC is the category — the RARC is the detail. Your entire analysis must be based on the CARC + RARC combination, not the CARC alone. For example: CO-16 alone means "claim lacks information" (vague). CO-16 + M76 means "claim denied specifically because diagnosis code is missing or invalid" — treat this as a diagnosis coding error, not a generic submission issue.
+
+${hasModifier ? `MODIFIER RECOGNITION & VALIDITY — APPLIES TO EVERY DENIAL TYPE WHEN MODIFIERS ARE PRESENT:
+The denied/billed lines carry one or more 2-character modifiers appended after the CPT, hyphen-separated. A single line may carry MULTIPLE modifiers — e.g. "45385-59-PT-33" = CPT 45385 with THREE modifiers: 59, PT, and 33. You must treat every modifier, not just the first.
+${modifierDetail ? `Modifiers on this claim: ${modifierDetail}` : ""}
+
+REQUIRED — do all of the following regardless of the denial code:
+1. ENUMERATE every modifier on each line individually. Never stop at the first one.
+2. DEFINE each modifier in plain terms (e.g. 59 = distinct procedural service; 26 = professional component; TC = technical component; 50 = bilateral; 51 = multiple procedures; PT = screening colonoscopy converted to diagnostic/therapeutic; 33 = preventive; RT/LT = anatomic side; XE/XS/XP/XU = specific subsets of 59; 22 = increased procedural services).
+3. ASSESS each modifier's appropriateness for its CPT and for this denial — state whether each one looks VALID or QUESTIONABLE and why.
+4. CHECK THE COMBINATION: flag conflicting modifiers (two pricing modifiers such as 26 + TC on one line; 51 together with 59), redundant pairs (59 alongside an X{EPSU} modifier), or any invalid HCPCS modifier combination — this is exactly what RARC N519 ("invalid combination of modifiers") describes.
+5. CHECK SEQUENCE: pricing/payment modifiers (26, TC, 50, 51, 59, 22, X{EPSU}) should be listed before informational/anatomic ones (e.g. GA, GY, PT, RT, LT). Note if the order looks wrong, since some payers deny on sequence.
+6. OUTPUT: populate "modifierGuidance" as an ARRAY with one entry per modifier in the format "<MODIFIER> — valid/questionable: <one-line reason>", plus a final entry for any combination or sequence issue. If there is only a single modifier, a single-string value is acceptable.
+
+For modifier DEFINITIONS and COMBINATION/SEQUENCE rules you may rely on your knowledge — these are stable and do not change quarterly. BUT if confirming a modifier's validity requires a CURRENT code-specific indicator (the NCCI PTP modifier indicator for a code pair, the MPFS bilateral surgery indicator, or the MPFS PC/TC indicator) and you do NOT have live search available for this denial, state which specific indicator the biller must verify rather than asserting its value from memory.` : ""}
+
+${isMedicalNecessity ? `MEDICAL NECESSITY VERDICT RULES:
+${icd10Codes
+  ? `ICD-10 codes ARE provided (${icd10Codes}). You MUST assess whether these diagnosis codes represent a covered indication for the denied CPT code under general Medicare or commercial payer LCD/NCD standards. Provide a LIKELY_TRUE or LIKELY_FALSE verdict based on whether the diagnosis-to-procedure pairing is clinically appropriate and typically covered. Do not default to CANNOT_DETERMINE when ICD-10 codes are available — make a reasoned assessment and flag what documentation would confirm it.
+
+LCD/NCD LOOKUP — MANDATORY:
+You MUST search for the ACTIVE, CURRENT governing LCD or NCD for CPT ${deniedStr}. Use these search queries in order:
+1. "active LCD CPT ${deniedStr} medicare coverage database site:cms.gov"
+2. "active NCD ${deniedStr} medicare national coverage determination current"
+3. "CMS active LCD article CPT ${deniedStr} ${icd10Codes} final"
+
+CRITICAL — LCD/NCD CURRENCY CHECK (must be applied before using any result):
+- CMS retires, supersedes, and replaces LCDs regularly (often quarterly). A retired LCD is legally void — citing it in an appeal or denial analysis is incorrect and misleading.
+- Before accepting any LCD or NCD from your search results, verify the document's STATUS field:
+  · ONLY accept policies with status: "Active", "Final", or "Effective"
+  · REJECT and DISCARD any policy with status: "Retired", "Withdrawn", "Superseded", "Replaced", or "Proposed"
+- If the first result is a retired LCD, continue searching for its active replacement. CMS typically links to the superseding document within the retired policy's record.
+- If multiple LCDs exist for the same CPT, use ONLY the one with the most recent effective date AND an Active status.
+- Set url to the direct CMS Medicare Coverage Database link for the ACTIVE article only (format: https://www.cms.gov/medicare-coverage-database/view/lcd.aspx?lcdId=XXXXX). Never link to a retired article.
+- If you find only retired policies and no active replacement, set articleNumber to null and write in summary: "No active LCD/NCD found — prior policy may have been retired without replacement; check CMS coverage database for current status."
+
+From your search results (active policies only), extract:
+- The article number (L##### for LCD, or ###.# for NCD — e.g. L33626 or NCD 210.1)
+- The full policy title
+- The direct CMS URL to that active article
+- Whether the ICD-10 code(s) ${icd10Codes} appear in the covered diagnosis list for CPT ${deniedStr}
+
+Populate the lcdNcdReference object with everything you find. If the search returns a real active article number, use it — it is not fabricated. If no active article number is found, set articleNumber to null.`
+  : `ICD-10 codes are NOT provided. You cannot assess medical necessity without knowing what diagnosis was billed. Return CANNOT_DETERMINE and clearly explain that the verdict requires ICD-10 diagnosis codes to evaluate coverage criteria. List in correctiveActions what the biller should do: retrieve the diagnosis codes from the claim and re-run the analysis.
+
+Set lcdNcdReference to: {"type":"NONE","articleNumber":null,"title":null,"url":null,"summary":"ICD-10 codes required to look up applicable LCD/NCD coverage criteria."}`
+}` : ""}
+
+${isNcci ? `NCCI BUNDLING VERDICT RULES — CRITICAL, READ CAREFULLY:
+In CMS NCCI PTP (Procedure-to-Procedure) edits, there are two columns:
+- COLUMN 1 = the comprehensive procedure (the one that is PAID — typically the higher/more complex code)
+- COLUMN 2 = the component procedure (the one that is BUNDLED/DENIED — typically the lesser code)
+
+When a payer denies the Column 2 code via CO-97 because Column 1 was paid, that is CORRECT bundling per NCCI rules.
+
+YOUR PRIMARY TASK FOR NCCI DENIALS:
+1. Identify which billed code is Column 1 (paid/comprehensive) and which is Column 2 (denied/component).
+2. If the DENIED code is Column 2 to the PAID code's Column 1 → the payer is CORRECTLY bundling → return LIKELY_TRUE.
+3. If the DENIED code is actually Column 1 and a lesser Column 2 code was paid → the payer bundled in the WRONG direction → return LIKELY_FALSE.
+
+CRITICAL TRAP TO AVOID — THIS IS THE MOST COMMON AI MISTAKE:
+A simpler/lesser procedure being denied when a more complex procedure was paid does NOT mean the denial is false. That is EXACTLY what NCCI bundling is designed to do — the comprehensive Column 1 code absorbs the component Column 2 code. Do NOT assume the denial is wrong just because the denied code seems "less comprehensive."
+
+EXAMPLE (the correct logic):
+- 45385 paid (snare polypectomy, Column 1) + 45380 denied (biopsy, Column 2) → LIKELY_TRUE denial — 45380 is a known Column 2 component of 45385 per NCCI PTP edits. The biopsy is considered integral to the polypectomy session.
+- The fact that 45380 is "less comprehensive" is the REASON it is bundled, not a reason to dispute it.
+
+MODIFIER EXCEPTION — the ONE valid reason to dispute an NCCI bundle:
+If modifier -59, -XS, -XU, or -XE is appended to the denied Column 2 code on the original claim, it signals the procedures were performed on a DISTINCT anatomical site or during a SEPARATE encounter. In that case:
+- If modifier IS present → return LIKELY_FALSE and explain the modifier signals a distinct service; advise checking documentation to confirm separate site/session.
+- If modifier is NOT present and the Column 1/2 relationship is confirmed → return LIKELY_TRUE and advise the biller to check whether a separate site was documented before deciding to appeal.
+
+For this specific case:
+- Billed/Paid CPT(s): ${billedStr}
+- Denied CPT(s): ${deniedStr}
+Determine the Column 1/Column 2 relationship, check if any modifier is present, and return the correct verdict with a clear explanation of the NCCI logic.` : ""}
+
+${isCodingModifier ? `MODIFIER / CODING-CONSISTENCY VERDICT RULES (CO-4 and modifier RARCs) — READ CAREFULLY:
+CO-4 means "the procedure code is inconsistent with the modifier used, OR a required modifier is missing." This is fundamentally a MODIFIER question — your entire analysis must center on the modifier, not the CPT alone.
+
+STEP 1 — ISOLATE THE MODIFIER(S):
+- Denied line(s): ${deniedStr}
+- Billed/paid line(s): ${billedStr || "Not provided"}
+Modifiers are appended to the CPT after hyphens, and a line may carry SEVERAL (e.g. "45385-59-PT-33" = modifiers 59, PT, and 33). Follow the MODIFIER RECOGNITION rules above to enumerate and evaluate EVERY modifier — do not analyze only the first. If NO modifier is present on the denied line, the denial likely means a REQUIRED modifier is MISSING — handle that under branch C below.
+
+STEP 2 — LOOK UP THE GOVERNING INDICATORS (you MUST search; do not assert from memory — these change quarterly/annually):
+1. "NCCI PTP modifier indicator ${deniedStr} ${billedStr || ""} current quarter"  (is a -59/-X{EPSU} bypass even allowed? indicator 0 = NOT allowed, 1 = allowed)
+2. "CPT ${deniedStr} MPFS bilateral surgery indicator"  (relevant if modifier 50/RT/LT used; indicator 0/2/9 means bilateral billing is NOT appropriate)
+3. "CPT ${deniedStr} MPFS PC TC indicator professional technical component"  (relevant if modifier 26/TC used; indicator 0 = global only, no PC/TC split exists)
+4. "CPT ${deniedStr} appropriate modifiers ${rarcCode || ""}"  (general CPT-to-modifier compatibility)
+
+STEP 3 — VERDICT LOGIC (apply in order):
+A. MODIFIER PRESENT BUT INVALID FOR THE CODE → the denial is VALID → return LIKELY_TRUE. Examples:
+   · Modifier 50 (bilateral) on a code whose MPFS bilateral indicator is 0, 2, or 9.
+   · Modifier 26 or TC on a code with PC/TC indicator 0 (no professional/technical split exists).
+   · Modifier 59 / XE / XS / XP / XU appended where the NCCI PTP modifier indicator for the pair is 0 (the edit cannot be bypassed by a modifier).
+   · Two conflicting payment modifiers on the same line (e.g. 51 + 59), or a duplicate modifier.
+   · An anatomic or device modifier the code does not recognize.
+   → The correct action is CORRECT THE MODIFIER AND REBILL, not appeal. Put concrete fix steps in correctiveActions. Only populate appealSteps if documentation might justify the modifier as billed.
+
+B. MODIFIER PRESENT AND VALID/APPROPRIATE, denial still issued → likely a payer edit error → return LIKELY_FALSE. Action = appeal with documentation showing the modifier was correct. Populate appealSteps.
+
+C. REQUIRED MODIFIER MISSING (no modifier, or wrong one, where one is needed) → the claim is correctable → return LIKELY_FALSE (disputable/correctable). Examples: a screening colonoscopy that became therapeutic billed without -PT (Medicare); a diagnostic test in a facility (POS ${placeOfService || "21/22/23"}) billed without -26; a bilateral procedure billed without -50 or -RT/-LT. → Action = ADD/CORRECT the modifier and RESUBMIT (put in correctiveActions), not a formal appeal.
+
+D. Cannot confirm the indicator from search → return CANNOT_DETERMINE and tell the biller exactly which indicator to check (NCCI PTP modifier indicator for the pair, or the MPFS bilateral / PC-TC indicator for the code).
+
+CRITICAL FRAMING — DO NOT MISS THIS:
+CO-4 is usually a CORRECT-AND-RESUBMIT denial, not a true/false appeal question. Lead the biller toward fixing the modifier and rebilling. Reserve appealSteps for when the modifier as billed was actually correct (branch B) or when documentation supports it. Always state the SPECIFIC modifier you analyzed and the SPECIFIC indicator value you found (or could not find) in verdictSummary.
+
+GI-SPECIFIC MODIFIER NOTES (gastroenterology):
+- -PT: screening colonoscopy converted to diagnostic/therapeutic (Medicare) — must be on the right line.
+- -33: preventive service (commercial screening).
+- -53: discontinued procedure — requires documentation of why it was stopped.
+- -59 / -XU: distinct procedural service to separate bundled GI procedures — only valid where the NCCI modifier indicator is 1.` : ""}
+
+${isAuth ? `PRIOR AUTHORIZATION VERDICT RULES:
+${payerName
+  ? `Payer IS provided (${payerName}). Use your search capability to look up ${payerName}'s current prior authorization requirements for the denied CPT code(s).
+
+${placeOfService
+  ? `Place of Service IS provided (POS ${placeOfService}). This is critical for auth verdicts — many payers require auth for a procedure in one setting but NOT in another (e.g. auth required for inpatient hospital POS 21 but not for office POS 11). Your search MUST be POS-specific.
+
+Use these search queries:
+1. "${payerName} prior authorization requirements CPT ${deniedStr} place of service ${placeOfService}"
+2. "${payerName} auth required POS ${placeOfService} CPT ${deniedStr}"
+3. "${payerName} clinical policy bulletin ${deniedStr} outpatient inpatient"
+
+In your verdict, explicitly state whether auth is required for CPT ${deniedStr} at POS ${placeOfService} under ${payerName}'s policy. If the policy differs by setting, note what POS codes DO require auth vs which do not.`
+  : `Place of Service is NOT provided. This limits auth verdict accuracy since many payers have POS-specific auth requirements. Use these search queries:
+1. "${payerName} prior authorization requirements CPT ${deniedStr}"
+2. "${payerName} clinical policy bulletin ${deniedStr}"
+
+In correctiveActions, instruct the biller to re-run with POS code selected for a more precise verdict.`
+}
+
+Based on what you find: if the CPT code IS on ${payerName}'s auth required list for the given POS and no auth was obtained, return LIKELY_TRUE. If the CPT code does NOT require auth under ${payerName}'s policy for this setting, return LIKELY_FALSE — this is a disputable denial. Cite the specific policy document found in your verdict reasoning.`
+  : `Payer name is NOT provided. You cannot search for payer-specific auth requirements without knowing the payer. Return CANNOT_DETERMINE and instruct the biller to re-run the analysis with the payer name entered — this will enable a targeted search of that payer's clinical policies and auth requirement lists.`
+}` : ""}
+
+${isCoverageDenial && payerName && icd10Codes ? `COVERAGE DENIAL VERDICT RULES:
+CO-96 (and similar coverage denials: CO-5, CO-182, CO-204, CO-233, CO-250) may be a TRUE
+benefits exclusion OR a misclassified medical necessity denial. This distinction drives the
+entire verdict — do not assume it is a hard exclusion without searching first.
+
+Payer IS provided (${payerName}). ICD-10 IS provided (${icd10Codes}).
+
+STEP 1 — Search for ${payerName}'s Clinical Policy Bulletin (CPB) for CPT ${deniedStr}:
+1. "${payerName} clinical policy bulletin CPT ${deniedStr} medically necessary covered"
+2. "${payerName} coverage policy ${deniedStr} ${icd10Codes} criteria indication"
+3. "${payerName} CPB ${deniedStr} exclusion covered medical necessity"
+
+STEP 2 — From your search results, answer all three questions:
+- Is CPT ${deniedStr} covered at all under ${payerName}'s plan when medically necessary?
+- Does ICD-10 ${icd10Codes} meet the covered indications listed in the CPB?
+- Is this a TRUE hard exclusion (plan never covers this procedure regardless of diagnosis)
+  or a soft denial (covered when medically necessary with supporting documentation)?
+
+STEP 3 — Verdict logic:
+- CPB confirms CPT ${deniedStr} IS covered when medically necessary AND ICD-10 ${icd10Codes}
+  is a listed covered indication → return LIKELY_FALSE. The denial is disputable. Populate
+  appealSteps with specific steps to appeal using the CPB and medical necessity documentation.
+  Cite the CPB by name/number in verdictSummary.
+- CPB confirms CPT ${deniedStr} is a hard plan exclusion regardless of diagnosis, with no
+  pathway to coverage → return LIKELY_TRUE.
+- No CPB found (smaller/regional payer with no public policy) OR policy is ambiguous →
+  return CANNOT_DETERMINE. In correctiveActions, instruct the biller to: (1) call
+  ${payerName}'s provider line and request the specific CPB for CPT ${deniedStr},
+  (2) ask whether there is any coverage pathway (medical necessity exception, appeals
+  pathway, or formulary exception process), (3) re-run the analysis once the CPB is obtained.
+
+PAYER NOTES BY TYPE:
+- Major commercial payers (Aetna, UnitedHealthcare, BCBS, Cigna, Humana, Anthem): publish
+  CPBs publicly — your search should find the current policy document.
+- Medicare: CO-96 typically indicates a true non-covered service. Check for applicable ABN
+  (Advance Beneficiary Notice) and whether the patient was informed. LCD/NCD path (CO-50)
+  is more appropriate for medical necessity disputes under Medicare.
+- Medicaid: policies vary by state. Search "[State] Medicaid fee schedule CPT ${deniedStr}"
+  if the state is known.
+- Regional/smaller payers: CPBs may not be publicly available. Return CANNOT_DETERMINE
+  if no policy document is found.
+
+ANTI-HALLUCINATION: Cite only the CPB you actually found via live search in this session.
+Do not fabricate CPB numbers, effective dates, or policy titles from training knowledge.` : ""}
+
+${isCoverageDenial && payerName && !icd10Codes ? `COVERAGE DENIAL — MISSING ICD-10:
+Payer IS provided (${payerName}) but ICD-10 codes are NOT provided. Without a diagnosis code
+you cannot determine whether the service meets the payer's medical necessity criteria for
+CPT ${deniedStr}. Return CANNOT_DETERMINE. In correctiveActions, instruct the biller to:
+1. Retrieve the ICD-10 diagnosis code(s) from the original claim or medical record.
+2. Re-run this analysis with the ICD-10 code(s) entered — this enables a CPB search.
+3. Confirm the diagnosis accurately reflects the clinical reason for the procedure.` : ""}
+
+${isCoverageDenial && !payerName ? `COVERAGE DENIAL — MISSING PAYER:
+Payer name is NOT provided. Without the payer name you cannot search for their Clinical
+Policy Bulletin to determine if this is a true exclusion or a disputable medical necessity
+denial. Return CANNOT_DETERMINE and instruct the biller to re-run with the payer name
+entered.` : ""}
+
+${!denialDescription ? `CUSTOM DENIAL CODE — the denial code "${denialCode}" was entered without a dictionary description (a custom code). FIRST establish the official standardized meaning of this exact CARC, populate "denialCodeDefinition" with it, and base your entire analysis on that correct meaning. Do not treat it as generic — identify what this specific code actually means.
+
+` : ""}${rarcCode ? `RARC DEFINITION — a remark code (${rarcCode}) was provided: populate "rarcDefinition" with the official standardized meaning of this exact remark code, and treat that specific meaning as the precise reason for the denial when forming your verdict.${!rarcDescription ? " This code was not in the local dictionary, so use the standardized X12 definition you know for it — do not leave it unexplained." : ""}
+
+` : ""}${ncciRelevant ? `NCCI SOURCE-CYCLE REPORTING — IMPORTANT:
+NCCI edit files are released quarterly (effective Jan 1, Apr 1, Jul 1, Oct 1). When you cite an NCCI source, report which quarterly cycle that SOURCE reflects, so the biller can tell whether it is current.
+- Populate the "ncciSourceCycle" field with the effective date or quarter STATED ON the NCCI source you actually used — e.g. "Q1 2026", "effective January 1, 2026", "April 2026 quarterly update" — copied from the page.
+- If the source you cited does NOT explicitly state an effective date or quarter, set "ncciSourceCycle" to null. DO NOT infer, estimate, or guess a date — a wrong currency date is worse than none.
+- If you did not use any NCCI source, set it to null.
+
+` : ""}Determine if this is a TRUE denial (valid) or FALSE denial (should be paid). Provide specific actionable guidance.
+
+DETAIL REQUIREMENTS — every array field must have at least 2–4 substantive items. Do not leave whyTrueDenial, whyFalseDenial, correctiveActions, appealSteps, documentationNeeded, or preventionTips as empty arrays unless there is a genuine reason. Each item should be a complete, actionable sentence specific to this denial — not a generic placeholder.
+
+Respond ONLY in this exact JSON structure:
+{"verdict":"TRUE|FALSE|LIKELY_TRUE|LIKELY_FALSE|CANNOT_DETERMINE","confidence":0-85 (max 85 if TRUE or FALSE; max 75 if LIKELY_TRUE or LIKELY_FALSE; must be 0 if CANNOT_DETERMINE),"verdictSummary":"one clear sentence explaining the verdict or why it cannot be determined","denialRuleExplained":"plain english explanation of ${denialCode}${rarcCode ? ` with remark code ${rarcCode}` : ""}","whyTrueDenial":[],"whyFalseDenial":[],"billingErrors":[],"correctiveActions":[],"appealSteps":[],"modifierGuidance":"null, OR a single advice string, OR (preferred when modifiers are present) an array of per-modifier strings each formatted '<MODIFIER> — valid/questionable: <reason>', with a final entry for any combination or sequence issue","documentationNeeded":[],"preventionTips":[],"timingAdvice":"deadline note or uncertainty disclaimer per rules","escalationPath":"general escalation process without fabricated contacts","lcdNcdReference":{"type":"LCD|NCD|NONE","articleNumber":"L##### or ###.# or null","title":"full policy title or null","url":"direct CMS URL to article or null","summary":"one sentence: does ICD-10 support coverage for this CPT under this policy, and what documentation is required"},"ncciSourceCycle":"the NCCI quarterly cycle or effective date STATED on the NCCI source you cited (e.g. 'Q1 2026' or 'effective January 1, 2026'), or null if no source states one — never guess","rarcDefinition":"if a RARC/remark code was provided, the official standardized meaning of that exact code (e.g. N115 -> 'This decision was based on a Local Coverage Determination (LCD)'); null if no RARC was provided","denialCodeDefinition":"if the denial code (CARC) was NOT described in the input (a custom code not in the dictionary), the official standardized meaning of that exact CARC; null if the code was already described"}`;
+
+  // ── Grounding fires for:
+  // - Medical necessity when ICD-10 codes provided (reads live LCD/NCD from CMS)
+  // - NCCI bundling always (reads live quarterly CMS edit tables for the CPT pair)
+  // - Auth denials when payer name is provided (searches payer's public clinical policy/auth list)
+  // - Coverage denials (CO-96 etc.) when payer name AND ICD-10 are both provided (searches payer CPB)
+  // NOTE: grounding is incompatible with response_mime_type JSON mode — extract JSON from text response
+  const useGrounding =
+    (isMedicalNecessity && !!icd10Codes) ||
+    isNcci ||
+    isCodingModifier ||
+    (isAuth && !!payerName) ||
+    (isCoverageDenial && !!payerName && !!icd10Codes);
+
+  // Use Pro for grounding cases (auth, NCCI, med necessity, coverage denial) — reliably supports Google Search.
+  // Use Flash Lite for non-grounding cases (coding errors, timely filing, etc.) — fast and cheap.
+  const modelEndpoint = useGrounding ? "gemini-2.5-pro" : "gemini-2.5-flash-lite";
+  const maxTokens     = useGrounding ? 5000 : 2000;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelEndpoint}:generateContent?key=${apiKey}`;
+
+  const requestBody = {
+    systemInstruction: { parts: [{ text: systemInstruction }] },
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: maxTokens,
+      ...(useGrounding ? {} : { response_mime_type: "application/json" }),
+    },
+    ...(useGrounding ? { tools: [{ googleSearch: {} }] } : {}),
+  };
+
+  async function callGemini(body) {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error("Gemini API error:", r.status, errText);
+      if (r.status === 429) throw { status: 429, message: "Daily limit or rate limit reached. Please wait a minute." };
+      throw { status: r.status, message: "Gemini API failed to respond." };
+    }
+    return r.json();
+  }
+
+  function extractJson(text) {
+    // 1. Try markdown-fenced JSON block first (grounded responses often wrap in ```json ... ```)
+    const fenced = text.match(/```json\s*([\s\S]*?)```/);
+    if (fenced) {
+      try { return JSON.parse(fenced[1].trim()); } catch {}
+    }
+    // 2. Try plain ``` block (no language tag)
+    const plainFenced = text.match(/```\s*([\s\S]*?)```/);
+    if (plainFenced) {
+      try { return JSON.parse(plainFenced[1].trim()); } catch {}
+    }
+    // 3. Fall back to first { ... last } span
+    const start = text.indexOf("{");
+    const end   = text.lastIndexOf("}");
+    if (start === -1 || end === -1) return null;
+    try { return JSON.parse(text.slice(start, end + 1)); } catch { return null; }
+  }
+
+  // ── NCCI quarterly cycle helpers ──
+  // The current cycle is derived deterministically from the date (NCCI releases Jan 1 / Apr 1 / Jul 1 / Oct 1).
+  // The source cycle is parsed from whatever the AI reported off the page it cited. We compare the two.
+  function currentNcciCycle(d = new Date()) {
+    const y = d.getFullYear();
+    const qIdx = Math.floor(d.getMonth() / 3); // 0..3
+    const windows = ["Jan 1 – Mar 31", "Apr 1 – Jun 30", "Jul 1 – Sep 30", "Oct 1 – Dec 31"];
+    return { year: y, q: qIdx + 1, label: `Q${qIdx + 1} ${y}`, window: `${windows[qIdx]}, ${y}` };
+  }
+
+  function parseCycleFromText(text) {
+    if (!text || typeof text !== "string") return null;
+    const t = text.toLowerCase();
+    const yearMatch = t.match(/20\d{2}/);
+    if (!yearMatch) return null;
+    const year = parseInt(yearMatch[0], 10);
+
+    const qMatch = t.match(/q([1-4])/);
+    if (qMatch) return { year, q: parseInt(qMatch[1], 10) };
+
+    const months = {
+      january:1, february:2, march:3, april:4, may:5, june:6, july:7, august:8,
+      september:9, october:10, november:11, december:12, jan:1, feb:2, mar:3,
+      apr:4, jun:6, jul:7, aug:8, sept:9, sep:9, oct:10, nov:11, dec:12,
+    };
+    for (const name of Object.keys(months)) {
+      if (t.includes(name)) return { year, q: Math.floor((months[name] - 1) / 3) + 1 };
+    }
+
+    const numDate = t.match(/(\d{1,2})[\/\-]\d{1,2}[\/\-]20\d{2}/);
+    if (numDate) {
+      const m = parseInt(numDate[1], 10);
+      if (m >= 1 && m <= 12) return { year, q: Math.floor((m - 1) / 3) + 1 };
+    }
+    const iso = t.match(/20\d{2}[\/\-](\d{1,2})/);
+    if (iso) {
+      const m = parseInt(iso[1], 10);
+      if (m >= 1 && m <= 12) return { year, q: Math.floor((m - 1) / 3) + 1 };
+    }
+    return null;
+  }
+
+  function buildNcciCurrency(sourceCycleText) {
+    const cur = currentNcciCycle();
+    const parsed = parseCycleFromText(sourceCycleText);
+    let status = "unknown"; // unknown | current | outdated | ahead
+    if (parsed) {
+      const curRank = cur.year * 4 + cur.q;
+      const srcRank = parsed.year * 4 + parsed.q;
+      status = srcRank === curRank ? "current" : srcRank < curRank ? "outdated" : "ahead";
+    }
+    return {
+      currentLabel: cur.label,
+      currentWindow: cur.window,
+      sourceCycleRaw: sourceCycleText || null,
+      sourceLabel: parsed ? `Q${parsed.q} ${parsed.year}` : null,
+      status,
+    };
+  }
+
+  try {
+    let geminiData;
+    let usedGrounding = useGrounding;
+
+    try {
+      geminiData = await callGemini(requestBody);
+    } catch (apiErr) {
+      // If grounding call fails (e.g. flash-lite doesn't support it), retry without grounding
+      if (useGrounding) {
+        console.warn("Grounding call failed — retrying without grounding:", apiErr);
+        usedGrounding = false;
+        const fallbackBody = {
+          ...requestBody,
+          generationConfig: { temperature: 0.1, maxOutputTokens: maxTokens, response_mime_type: "application/json" },
+        };
+        delete fallbackBody.tools;
+        geminiData = await callGemini(fallbackBody);
+      } else {
+        return res.status(apiErr.status || 500).json({ error: apiErr.message || "Gemini API failed." });
+      }
+    }
+
+    // Auth denials REQUIRE live grounding to give a verdict.
+    // If grounding was intended but fell back, returning a payer-specific verdict
+    // would be hallucination — return CANNOT_DETERMINE immediately instead.
+    if (useGrounding && !usedGrounding && isAuth) {
+      return res.status(200).json({
+        verdict: "CANNOT_DETERMINE",
+        confidence: 0,
+        verdictSummary: `Live search of ${payerName || "payer"} authorization policy was unavailable. Prior auth requirements are payer-specific and cannot be reliably verified from AI training data. Verify directly with ${payerName || "the payer"}.`,
+        denialRuleExplained: `CO-197 means precertification was not obtained before the service was rendered. Whether this denial is valid depends entirely on ${payerName || "the payer"}'s current authorization requirements for CPT ${deniedStr}${placeOfService ? ` at POS ${placeOfService}` : ""} — this cannot be confirmed without live policy data.`,
+        whyTrueDenial: [],
+        whyFalseDenial: [],
+        billingErrors: [],
+        correctiveActions: [
+          `Call ${payerName || "the payer"}'s provider line and ask specifically: does CPT ${deniedStr} require prior authorization at ${placeOfService ? `POS ${placeOfService}` : "the billed place of service"}?`,
+          "Request a copy of the current authorization requirements list for this CPT and setting.",
+          "Check the payer's provider portal for a real-time auth requirement lookup.",
+          "If authorization was actually obtained, locate the auth number and resubmit with it on the claim.",
+        ],
+        appealSteps: [
+          "Pull the original remittance advice and confirm the denial reason is solely CO-197.",
+          "If auth was obtained prior to service, submit first-level appeal with the authorization number and approval documentation.",
+          "If auth was not obtained, check whether the payer allows retrospective authorization for this CPT code.",
+          "Submit a written appeal explaining the clinical urgency if retrospective auth is denied.",
+        ],
+        modifierGuidance: null,
+        documentationNeeded: [
+          "Prior authorization number (if obtained)",
+          `${payerName || "Payer"}'s current auth requirement list for CPT ${deniedStr}`,
+          placeOfService ? `Confirmation that POS ${placeOfService} requires auth for this CPT` : "Place of service documentation",
+        ],
+        preventionTips: [
+          `Verify ${payerName || "payer"} auth requirements for CPT ${deniedStr} at every place of service before scheduling.`,
+          "Use the payer's provider portal or call the auth line at least 3–5 business days before the procedure.",
+          "Document the auth number, approval date, and approving agent name on every case.",
+        ],
+        timingAdvice: "Verify the exact appeal deadline directly with the payer — do not rely on an estimate.",
+        escalationPath: "First-level internal appeal → second-level appeal or peer-to-peer review → external independent review → state insurance commissioner if applicable.",
+        lcdNcdReference: { type: "NONE", articleNumber: null, title: null, url: null, summary: null },
+        wasGrounded: false,
+        sources: null,
+      });
+    }
+
+    // Coverage denials also need live grounding to determine if it's a true exclusion.
+    // If grounding falls back, provide a CANNOT_DETERMINE with clear biller instructions.
+    if (useGrounding && !usedGrounding && isCoverageDenial) {
+      return res.status(200).json({
+        verdict: "CANNOT_DETERMINE",
+        confidence: 0,
+        verdictSummary: `Live search of ${payerName || "payer"} clinical policy was unavailable. Cannot determine whether CPT ${deniedStr} is a true plan exclusion or a disputable medical necessity denial without reviewing the payer's Clinical Policy Bulletin.`,
+        denialRuleExplained: `CO-96 means the payer has determined this service is not a covered benefit under the patient's plan. This may be a true exclusion or a misclassified medical necessity denial — the distinction requires reviewing ${payerName || "the payer"}'s Clinical Policy Bulletin for CPT ${deniedStr}.`,
+        whyTrueDenial: [],
+        whyFalseDenial: [],
+        billingErrors: [],
+        correctiveActions: [
+          `Call ${payerName || "the payer"}'s provider line and request the Clinical Policy Bulletin (CPB) for CPT ${deniedStr}.`,
+          "Ask specifically: is this a hard plan exclusion, or is there a coverage pathway if medical necessity is documented?",
+          "Retrieve the ICD-10 diagnosis code from the claim and confirm it accurately reflects the clinical indication.",
+          "Re-run this analysis once the CPB is obtained for a specific verdict.",
+        ],
+        appealSteps: [
+          "Submit a first-level appeal with the medical record documenting the clinical necessity for the procedure.",
+          "Include the treating provider's letter of medical necessity citing the diagnosis and clinical findings.",
+          "Reference any applicable CPB language that supports coverage under medical necessity criteria.",
+          "If the first appeal is denied, request an external independent review.",
+        ],
+        modifierGuidance: null,
+        documentationNeeded: [
+          `${payerName || "Payer"}'s Clinical Policy Bulletin for CPT ${deniedStr}`,
+          "ICD-10 diagnosis code(s) from the original claim",
+          "Letter of medical necessity from the treating provider",
+          "Clinical documentation supporting medical necessity (operative notes, office notes, imaging reports)",
+        ],
+        preventionTips: [
+          `Before scheduling CPT ${deniedStr}, verify coverage under the patient's specific ${payerName || "payer"} plan benefit.`,
+          "Obtain the payer's CPB for procedures that are commonly denied as non-covered.",
+          "Ensure the diagnosis code accurately and specifically reflects the medical indication.",
+        ],
+        timingAdvice: "Verify the exact appeal deadline directly with the payer — do not rely on an estimate.",
+        escalationPath: "First-level internal appeal → second-level appeal → external independent review → state insurance commissioner if applicable.",
+        lcdNcdReference: { type: "NONE", articleNumber: null, title: null, url: null, summary: null },
+        wasGrounded: false,
+        sources: null,
+      });
+    }
+
+    // Safety check first
+    if (!geminiData?.candidates?.length) {
+      return res.status(500).json({ error: "The AI blocked this response due to safety filters. Try simplifying your context." });
+    }
+
+    const rawText = geminiData.candidates[0]?.content?.parts?.[0]?.text || "";
+    if (!rawText) {
+      return res.status(500).json({ error: "AI returned an empty response. Please try again." });
+    }
+
+    // Parse JSON — for grounded calls extract from prose, for JSON-mode parse directly
+    let parsed = usedGrounding ? extractJson(rawText) : (() => { try { return JSON.parse(rawText); } catch { return null; } })();
+
+    if (!parsed) {
+      // Last resort: try extractJson even on non-grounded responses
+      parsed = extractJson(rawText);
+      if (!parsed) {
+        console.error("Failed to parse Gemini output:", rawText.slice(0, 500));
+        return res.status(500).json({ error: "AI returned an unreadable format. Please try again." });
+      }
+    }
+
+    // Extract grounding source links if present
+    const groundingChunks = geminiData.candidates[0]?.groundingMetadata?.groundingChunks || [];
+    const sources = groundingChunks
+      .filter(c => c?.web?.uri && c?.web?.title)
+      .map(c => ({ url: c.web.uri, title: c.web.title }))
+      .filter((s, i, arr) => arr.findIndex(x => x.url === s.url) === i)
+      .slice(0, 5);
+
+    return res.status(200).json({
+      ...parsed,
+      sources: sources.length > 0 ? sources : null,
+      wasGrounded: usedGrounding && sources.length > 0,
+      ncciCurrency: ncciRelevant ? buildNcciCurrency(parsed.ncciSourceCycle) : null,
+      coverageCheck,
+    });
+
+  } catch (err) {
+    console.error("Critical server error:", err);
+    return res.status(500).json({ error: "Internal server error. Please try again later." });
+  }
+}
